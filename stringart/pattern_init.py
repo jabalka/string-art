@@ -3,40 +3,70 @@ import numpy as np
 import cv2
 from typing import List, Tuple
 
-def render_star_pattern(n: int, k: int, steps: int, canvas: int, nails_xy) -> np.ndarray:
-    """
-    Draw a star polygon i -> i+k for 'steps' hops on a blank canvas. Returns float32 [0..1].
-    """
-    img = np.zeros((canvas, canvas), dtype=np.float32)
-    i = 0
-    for _ in range(steps):
-        j = (i + k) % n
-        x1, y1 = nails_xy[i]; x2, y2 = nails_xy[j]
-        cv2.line(img, (int(round(x1)), int(round(y1))), (int(round(x2)), int(round(y2))), 1.0, thickness=1, lineType=cv2.LINE_AA)
-        i = j
-    img = cv2.GaussianBlur(img, (0,0), 0.8)  # soften
-    img = np.clip(img, 0.0, 1.0)
-    return img
+def render_star_pattern(
+    nail_count: int,
+    hop_k: int,
+    num_hops: int,
+    canvas_size: int,
+    nail_positions,
+) -> np.ndarray:
+    """Draw a simple star polygon pattern i -> (i + hop_k) over num_hops steps.
 
-def choose_best_k_by_correlation(n: int, ks: List[int], boots: int, target_small: np.ndarray, nails_xy_small) -> Tuple[int, float]:
-    best_k, best_score = ks[0], -1.0
-    t = target_small / (np.linalg.norm(target_small)+1e-6)
-    for k in ks:
-        pat = render_star_pattern(n, k, steps=boots, canvas=target_small.shape[0], nails_xy=nails_xy_small)
-        p = pat / (np.linalg.norm(pat)+1e-6)
-        score = float((t * p).sum())   # cosine similarity
+    Returns a float32 image in [0,1] useful for correlation-based bootstrapping.
+    """
+    raster = np.zeros((canvas_size, canvas_size), dtype=np.float32)
+    current_index = 0
+    for _ in range(num_hops):
+        next_index = (current_index + hop_k) % nail_count
+        x1, y1 = nail_positions[current_index]
+        x2, y2 = nail_positions[next_index]
+        cv2.line(
+            raster,
+            (int(round(x1)), int(round(y1))),
+            (int(round(x2)), int(round(y2))),
+            1.0,
+            thickness=1,
+            lineType=cv2.LINE_AA,
+        )
+        current_index = next_index
+    raster = cv2.GaussianBlur(raster, (0, 0), 0.8)  # soften edges
+    return np.clip(raster, 0.0, 1.0)
+
+def choose_best_k_by_correlation(
+    nail_count: int,
+    hop_candidates: List[int],
+    bootstrap_steps_count: int,
+    target_small: np.ndarray,
+    nail_positions_small,
+) -> Tuple[int, float]:
+    """Pick hop value (k) giving star pattern most correlated with target.
+
+    Uses cosine similarity on a downscaled target to select a promising initial
+    star polygon stride for bootstrap instructions.
+    """
+    best_hop_k, best_score = hop_candidates[0], -1.0
+    target_unit = target_small / (np.linalg.norm(target_small) + 1e-6)
+    for hop_k in hop_candidates:
+        pattern = render_star_pattern(
+            nail_count,
+            hop_k,
+            num_hops=bootstrap_steps_count,
+            canvas_size=target_small.shape[0],
+            nail_positions=nail_positions_small,
+        )
+        pattern_unit = pattern / (np.linalg.norm(pattern) + 1e-6)
+        score = float((target_unit * pattern_unit).sum())
         if score > best_score:
-            best_score = score; best_k = k
-    return best_k, best_score
+            best_score = score
+            best_hop_k = hop_k
+    return best_hop_k, best_score
 
-def bootstrap_steps(n: int, k: int, boots: int) -> List[Tuple[int,int]]:
-    """
-    Produce an initial (i->i+k) step list of length 'boots'.
-    """
-    steps_out: List[Tuple[int,int]] = []
-    i = 0
-    for _ in range(boots):
-        j = (i + k) % n
-        steps_out.append((i, j))
-        i = j
+def bootstrap_steps(nail_count: int, hop_k: int, num_steps: int) -> List[Tuple[int, int]]:
+    """Create an initial step sequence (i -> i + hop_k) of given length."""
+    steps_out: List[Tuple[int, int]] = []
+    current_index = 0
+    for _ in range(num_steps):
+        next_index = (current_index + hop_k) % nail_count
+        steps_out.append((current_index, next_index))
+        current_index = next_index
     return steps_out

@@ -5,191 +5,183 @@ import cv2
 import numpy.fft as fft
 
 
-def _radial_edge_profile(gray01: np.ndarray, cx: int, cy: int, r_min: int, r_max: int) -> int:
+def _radial_edge_profile(image_gray: np.ndarray, center_x: int, center_y: int, min_radius: int, max_radius: int) -> int:
+    """Fallback radius finder using radial gradient energy.
+
+    For each candidate radius we sample points uniformly on the circle, bilinearly
+    interpolate the gradient magnitude image, and keep the radius with maximum
+    average response. This helps when HoughCircles fails.
     """
-    Fallback: pick radius where the radial edge energy is maximized.
-    Looks at gradient magnitude sampled on circles of increasing radius.
-    """
-    H, W = gray01.shape
-    gx = cv2.Sobel(gray01, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray01, cv2.CV_32F, 0, 1, ksize=3)
-    mag = np.sqrt(gx * gx + gy * gy)
+    height, width = image_gray.shape
+    grad_x = cv2.Sobel(image_gray, cv2.CV_32F, 1, 0, ksize=3)
+    grad_y = cv2.Sobel(image_gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad_mag = np.sqrt(grad_x * grad_x + grad_y * grad_y)
 
     thetas = np.linspace(-np.pi / 2, 3 * np.pi / 2, 2048, endpoint=False).astype(np.float32)
-    ct = np.cos(thetas)
-    st = np.sin(thetas)
+    cos_t = np.cos(thetas)
+    sin_t = np.sin(thetas)
 
-    best_r, best_s = r_min, -1.0
-    for r in range(r_min, r_max + 1):
-        xs = cx + r * ct
-        ys = cy + r * st
-        xs = np.clip(xs, 0, W - 1 - 1e-3)
-        ys = np.clip(ys, 0, H - 1 - 1e-3)
-        x0 = np.floor(xs).astype(np.int32)
+    best_radius, best_score = min_radius, -1.0
+    for radius in range(min_radius, max_radius + 1):
+        sample_x = center_x + radius * cos_t
+        sample_y = center_y + radius * sin_t
+        sample_x = np.clip(sample_x, 0, width - 1 - 1e-3)
+        sample_y = np.clip(sample_y, 0, height - 1 - 1e-3)
+        x0 = np.floor(sample_x).astype(np.int32)
         x1 = x0 + 1
-        y0 = np.floor(ys).astype(np.int32)
+        y0 = np.floor(sample_y).astype(np.int32)
         y1 = y0 + 1
-        wx = xs - x0
-        wy = ys - y0
-        Ia = mag[y0, x0]
-        Ib = mag[y0, x1]
-        Ic = mag[y1, x0]
-        Id = mag[y1, x1]
-        ring = Ia * (1 - wx) * (1 - wy) + Ib * wx * (1 - wy) + Ic * (1 - wx) * wy + Id * wx * wy
-        s = float(ring.mean())
-        if s > best_s:
-            best_s = s
-            best_r = r
-    return best_r
+        wx = sample_x - x0
+        wy = sample_y - y0
+        Ia = grad_mag[y0, x0]
+        Ib = grad_mag[y0, x1]
+        Ic = grad_mag[y1, x0]
+        Id = grad_mag[y1, x1]
+        ring_samples = Ia * (1 - wx) * (1 - wy) + Ib * wx * (1 - wy) + Ic * (1 - wx) * wy + Id * wx * wy
+        score = float(ring_samples.mean())
+        if score > best_score:
+            best_score = score
+            best_radius = radius
+    return best_radius
 
 
-def detect_board_circle(gray01: np.ndarray) -> Tuple[int, int, int]:
+def detect_board_circle(image_gray: np.ndarray) -> Tuple[int, int, int]:
+    """Detect (center_x, center_y, radius) of the circular board.
+
+    Strategy:
+      1. Attempt Hough circle detection on a blurred grayscale copy.
+      2. If that fails, fall back to radial gradient energy scanning.
+      3. Expand the detected radius slightly (6%) to avoid clipping outer threads.
+    Returns integer pixel coordinates and radius.
     """
-    Try Hough first; if weak, use a radial edge profile.
-    Then return a *slightly larger* radius to be generous (avoid clipping threads).
-    """
-    H, W = gray01.shape
-    g8 = (gray01 * 255).astype(np.uint8)
-    g_blur = cv2.GaussianBlur(g8, (0, 0), 2.0)
-    m = min(H, W)
+    height, width = image_gray.shape
+    uint8_img = (image_gray * 255).astype(np.uint8)
+    blurred = cv2.GaussianBlur(uint8_img, (0, 0), 2.0)
+    min_side = min(height, width)
 
-    # Hough with wider search
     circles = cv2.HoughCircles(
-        g_blur,
+        blurred,
         cv2.HOUGH_GRADIENT,
         dp=1.3,
-        minDist=int(m * 0.5),
+        minDist=int(min_side * 0.5),
         param1=120,
         param2=40,
-        minRadius=int(m * 0.35),
-        maxRadius=int(m * 0.60),
+        minRadius=int(min_side * 0.35),
+        maxRadius=int(min_side * 0.60),
     )
     if circles is not None and len(circles) > 0:
-        x, y, r = circles[0][0]
-        cx, cy, R = int(round(x)), int(round(y)), int(round(r))
+        x_center, y_center, radius = circles[0][0]
+        center_x, center_y, board_radius = int(round(x_center)), int(round(y_center)), int(round(radius))
     else:
-        # center fallback
-        cx = cy = m // 2
-        R = _radial_edge_profile(gray01, cx, cy, int(m * 0.35), int(m * 0.60))
+        center_x = center_y = min_side // 2
+        board_radius = _radial_edge_profile(image_gray, center_x, center_y, int(min_side * 0.35), int(min_side * 0.60))
 
-    # Be generous by a few percent so we don't trim outer strings
-    R = int(round(R * 1.06))  # +6%
-    # Clamp inside image
-    R = max(10, min(R, (m // 2) - 2))
-    return cx, cy, R
+    board_radius = int(round(board_radius * 1.06))  # +6% generosity
+    board_radius = max(10, min(board_radius, (min_side // 2) - 2))
+    return center_x, center_y, board_radius
 
 
 def detect_nail_count(
-    gray01: np.ndarray,
-    cx: int,
-    cy: int,
-    R: int,
-    n_min: int = 20,
-    n_max: int = 400,
+    image_gray: np.ndarray,
+    center_x: int,
+    center_y: int,
+    board_radius: int,
+    min_nails: int = 20,
+    max_nails: int = 400,
     smooth_sigma: float = 2.0,
     suppress_harmonics: bool = True,
     debug_dir: Optional[str] = None,
 ) -> int:
-    """Estimate nail count using a robust ring signal analysis.
+    """Estimate the number of nails by analyzing intensity variation along the rim.
 
-    Improvements over the previous simplistic FFT pick:
-      * Adaptive min/max range (n_min..n_max)
-      * Gaussian smoothing of the angular signal to reduce spurious high freq noise
-      * Optional harmonic suppression: divide spectrum by smoothed version and penalize multiples
-      * Peak prominence filtering to avoid picking double counts (e.g., 36 -> 72)
-      * Fallback to nearest multiple of 4 if within tolerance (common board design)
+    Method summary:
+      * Sample grayscale values on a ring slightly inside the detected board radius.
+      * Normalize polarity so nail heads become peaks (invert if needed).
+      * Remove DC component, optionally smooth.
+      * FFT -> pick strongest frequency after harmonic suppression & prominence checks.
+      * Guard against double-frequency (e.g., 36 misread as 72) by checking half bin.
+      * Snap to nearest multiple of 4 if close (typical board layout).
     """
-    samples = 4096
-    thetas = np.linspace(0, 2 * np.pi, samples, endpoint=False)
-    ring_r = max(5, R - 5)
-    xs = cx + ring_r * np.cos(thetas)
-    ys = cy + ring_r * np.sin(thetas)
-    xs = np.clip(xs, 0, gray01.shape[1] - 1)
-    ys = np.clip(ys, 0, gray01.shape[0] - 1)
-    vals = gray01[ys.astype(int), xs.astype(int)].astype(np.float32)
-    # emphasize nail heads as dark peaks by inverting if background brighter
-    # decide simple polarity: compare mean of darkest 5% vs brightest 5%
-    v_sorted = np.sort(vals)
-    dark_mean = float(v_sorted[: int(0.05 * len(v_sorted))].mean())
-    bright_mean = float(v_sorted[int(0.95 * len(v_sorted)) :].mean())
-    if dark_mean > bright_mean:  # invert so nails become peaks after processing
-        vals = 1.0 - vals
-    # remove low-frequency bias
-    vals = vals - vals.mean()
-    # smooth angular noise
+    angular_samples = 4096
+    thetas = np.linspace(0, 2 * np.pi, angular_samples, endpoint=False)
+    sampling_radius = max(5, board_radius - 5)
+    sample_x = center_x + sampling_radius * np.cos(thetas)
+    sample_y = center_y + sampling_radius * np.sin(thetas)
+    sample_x = np.clip(sample_x, 0, image_gray.shape[1] - 1)
+    sample_y = np.clip(sample_y, 0, image_gray.shape[0] - 1)
+    ring_values = image_gray[sample_y.astype(int), sample_x.astype(int)].astype(np.float32)
+
+    sorted_vals = np.sort(ring_values)
+    darkest_mean = float(sorted_vals[: int(0.05 * len(sorted_vals))].mean())
+    brightest_mean = float(sorted_vals[int(0.95 * len(sorted_vals)) :].mean())
+    if darkest_mean > brightest_mean:  # invert so nail heads are peaks
+        ring_values = 1.0 - ring_values
+    ring_values = ring_values - ring_values.mean()
+
     if smooth_sigma > 0:
-        k = int(smooth_sigma * 6) | 1
-        g = cv2.getGaussianKernel(k, smooth_sigma)
-        g = (g / g.sum()).astype(np.float32).ravel()
-        vals = np.convolve(vals, g, mode="same")
-    spectrum = np.abs(fft.rfft(vals))
-    freqs = np.arange(spectrum.size)  # since d=1, index==frequency bin
-    # restrict plausible range
-    lo = max(2, n_min)
-    hi = min(n_max, freqs[-1])
-    if lo >= hi:
-        return max(lo, 2)
-    spec_range = spectrum.copy()
-    # harmonic suppression: divide by a local median-smoothed spectrum
+        kernel = int(smooth_sigma * 6) | 1
+        gk = cv2.getGaussianKernel(kernel, smooth_sigma)
+        gk = (gk / gk.sum()).astype(np.float32).ravel()
+        ring_values = np.convolve(ring_values, gk, mode="same")
+
+    spectrum = np.abs(fft.rfft(ring_values))
+    frequency_bins = np.arange(spectrum.size)
+    low = max(2, min_nails)
+    high = min(max_nails, frequency_bins[-1])
+    if low >= high:
+        return max(low, 2)
+    raw_spectrum = spectrum.copy()
     if suppress_harmonics:
-        win = 9
-        half = win // 2
-        med = np.zeros_like(spec_range)
-        for i in range(spec_range.size):
-            a = max(0, i - half)
-            b = min(spec_range.size, i + half + 1)
-            med[i] = np.median(spec_range[a:b])
-        med = np.maximum(med, 1e-6)
-        spec_norm = spec_range / med
+        window = 9
+        half_window = window // 2
+        local_median = np.zeros_like(raw_spectrum)
+        for idx in range(raw_spectrum.size):
+            a = max(0, idx - half_window)
+            b = min(raw_spectrum.size, idx + half_window + 1)
+            local_median[idx] = np.median(raw_spectrum[a:b])
+        local_median = np.maximum(local_median, 1e-6)
+        spectrum_norm = raw_spectrum / local_median
     else:
-        spec_norm = spec_range
-    search = spec_norm.copy()
-    search[: lo] = 0.0
-    search[hi + 1 :] = 0.0
-    # penalize obvious multiples to avoid picking 2x actual nails
-    for k in range(lo, hi + 1):
-        if 2 * k < search.size:
-            if search[2 * k] > search[k]:
-                search[2 * k] *= 0.75  # damp second harmonic
-        if 3 * k < search.size:
-            search[3 * k] *= 0.85
-    k_best = int(np.argmax(search))
-    peak_val = search[k_best]
-    # Consider half-frequency if even (possible double counting)
-    if k_best % 2 == 0 and (k_best // 2) >= lo:
-        k_half = k_best // 2
-        # heuristic: if half bin has at least 55% of amplitude after normalization, prefer half
-        if search[k_half] >= 0.55 * peak_val:
-            k_best = k_half
-            peak_val = search[k_best]
-    # peak prominence check: ensure local dominance
-    neigh = search[max(lo, k_best - 5) : min(hi, k_best + 6)]
-    if peak_val < 1.12 * (np.median(neigh) + 1e-9):
-        top_idx = np.argsort(search[lo : hi + 1])[-5:] + lo
-        weights = search[top_idx]
-        k_weighted = int(np.round(np.sum(top_idx * weights) / (np.sum(weights) + 1e-9)))
-        if abs(k_weighted - k_best) > 0:  # adopt weighted if different and plausible
-            k_best = k_weighted
-    # snap to nearest multiple of 4 if within 2%
-    k4 = int(round(k_best / 4.0) * 4)
-    if k4 >= lo and k4 <= hi and abs(k4 - k_best) / max(1, k_best) < 0.02:
-        k_best = k4
-    k_best = int(np.clip(k_best, lo, hi))
+        spectrum_norm = raw_spectrum
+
+    search_space = spectrum_norm.copy()
+    search_space[: low] = 0.0
+    search_space[high + 1 :] = 0.0
+    for k in range(low, high + 1):
+        if 2 * k < search_space.size and search_space[2 * k] > search_space[k]:
+            search_space[2 * k] *= 0.75
+        if 3 * k < search_space.size:
+            search_space[3 * k] *= 0.85
+    best_k = int(np.argmax(search_space))
+    best_amp = search_space[best_k]
+    if best_k % 2 == 0 and (best_k // 2) >= low:
+        half_k = best_k // 2
+        if search_space[half_k] >= 0.55 * best_amp:
+            best_k = half_k
+            best_amp = search_space[best_k]
+    neighborhood = search_space[max(low, best_k - 5) : min(high, best_k + 6)]
+    if best_amp < 1.12 * (np.median(neighborhood) + 1e-9):
+        top_indices = np.argsort(search_space[low : high + 1])[-5:] + low
+        weights = search_space[top_indices]
+        weighted = int(np.round(np.sum(top_indices * weights) / (np.sum(weights) + 1e-9)))
+        if abs(weighted - best_k) > 0:
+            best_k = weighted
+    nearest_multiple_4 = int(round(best_k / 4.0) * 4)
+    if nearest_multiple_4 >= low and nearest_multiple_4 <= high and abs(nearest_multiple_4 - best_k) / max(1, best_k) < 0.02:
+        best_k = nearest_multiple_4
+    best_k = int(np.clip(best_k, low, high))
     if debug_dir:
         try:
             import matplotlib.pyplot as plt
             import os
             os.makedirs(debug_dir, exist_ok=True)
             fig, axs = plt.subplots(3, 1, figsize=(8, 6), constrained_layout=True)
-            axs[0].plot(vals, lw=0.8)
-            axs[0].set_title("Angular ring signal (smoothed)")
-            axs[1].plot(spectrum, lw=0.8)
-            axs[1].axvline(k_best, color='r', ls='--'); axs[1].set_title(f"Raw spectrum | chosen k={k_best}")
-            axs[2].plot(search, lw=0.8)
-            axs[2].axvline(k_best, color='r', ls='--'); axs[2].set_title("Search (norm + suppression)")
-            for ax in axs: ax.set_xlim(lo - 5, hi + 5)
+            axs[0].plot(ring_values, lw=0.8); axs[0].set_title("Angular ring signal (smoothed)")
+            axs[1].plot(spectrum, lw=0.8); axs[1].axvline(best_k, color='r', ls='--'); axs[1].set_title(f"Raw spectrum | chosen k={best_k}")
+            axs[2].plot(search_space, lw=0.8); axs[2].axvline(best_k, color='r', ls='--'); axs[2].set_title("Search (norm + suppression)")
+            for ax in axs: ax.set_xlim(low - 5, high + 5)
             fig.savefig(os.path.join(debug_dir, "nail_detect_debug.png"), dpi=140)
             plt.close(fig)
         except Exception:
             pass
-    return k_best
+    return best_k

@@ -5,74 +5,94 @@ from dataclasses import dataclass
 
 @dataclass
 class HoleEstimate:
-    frac: float  # inner hole radius / outer radius
-    mode: str    # 'skip' or 'dampen'
+    """Detected inner void information.
+
+    Attributes:
+        radius_fraction:   Estimated inner hole radius divided by board radius.
+        mode:              Suggested handling strategy: 'skip' or 'dampen'.
+        confidence:        Heuristic [0,1] confidence score in the detection.
+    """
+    radius_fraction: float
+    mode: str
     confidence: float
 
-def estimate_inner_hole(target: np.ndarray, outer_radius: int, center: tuple[int,int] | None = None,
-                        min_frac: float = 0.03, max_frac: float = 0.35,
-                        smooth: int = 5) -> HoleEstimate:
-    """Estimate inner hole radius by radial profile.
+def estimate_inner_hole(
+    target_image: np.ndarray,
+    outer_radius_px: int,
+    center: tuple[int, int] | None = None,
+    min_radius_fraction: float = 0.03,
+    max_radius_fraction: float = 0.35,
+    smooth_window: int = 5,
+) -> HoleEstimate:
+    """Estimate the central void (if any) using a radial intensity profile.
 
-    Steps:
-      1. Compute radial mean intensity.
-      2. Find first significant valley (low mean region) followed by rise.
-      3. Validate contrast ratio and set mode based on depth.
-    Returns a HoleEstimate; if no hole, frac=0.0.
+    Heuristic:
+      1. Compute radial mean intensity from center to outer radius.
+      2. Search a radius band [min_radius_fraction, max_radius_fraction].
+      3. Pick the lowest valley; measure depth relative to mid-ring baseline.
+      4. Derive confidence from depth; choose mode 'skip' (fully exclude) if deep
+         or 'dampen' (partial penalty) if shallow but present.
+    Returns a HoleEstimate with radius_fraction=0 when no convincing hole is found.
     """
-    h, w = target.shape
+    height, width = target_image.shape
     if center is None:
-        cx = cy = h // 2
+        center_x = center_y = height // 2
     else:
-        cx, cy = center
+        center_x, center_y = center
 
-    yy, xx = np.indices(target.shape)
-    rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
-    rmax = float(outer_radius)
-    mask_outer = rr <= rmax
-    vals = target[mask_outer]
-    rvals = rr[mask_outer]
+    y_coords, x_coords = np.indices(target_image.shape)
+    radial_dist = np.sqrt((x_coords - center_x) ** 2 + (y_coords - center_y) ** 2)
+    outer_radius_f = float(outer_radius_px)
+    inside_mask = radial_dist <= outer_radius_f
+    pixel_values = target_image[inside_mask]
+    pixel_radii = radial_dist[inside_mask]
 
-    bins = np.linspace(0, rmax, 512)
-    idx = np.digitize(rvals, bins) - 1
-    prof = np.zeros(len(bins), dtype=np.float32)
-    counts = np.bincount(idx, minlength=len(bins)) + 1e-6
-    for i in range(len(bins)):
-        prof[i] = float(vals[idx == i].mean()) if (idx == i).any() else prof[i-1] if i>0 else 0.0
-    if smooth > 1:
-        k = smooth if smooth % 2 == 1 else smooth + 1
-        prof = cv2.GaussianBlur(prof.reshape(-1,1), (0,0), k*0.15).ravel()
+    radial_bins = np.linspace(0, outer_radius_f, 512)
+    bin_index = np.digitize(pixel_radii, radial_bins) - 1
+    radial_profile = np.zeros(len(radial_bins), dtype=np.float32)
+    for i in range(len(radial_bins)):
+        sel = bin_index == i
+        if sel.any():
+            radial_profile[i] = float(pixel_values[sel].mean())
+        elif i > 0:
+            radial_profile[i] = radial_profile[i - 1]
 
-    # Normalize profile
-    pmin, pmax = prof.min(), prof.max()
-    rng = pmax - pmin + 1e-6
-    nprof = (prof - pmin) / rng
+    if smooth_window > 1:
+        gaussian_size = smooth_window if smooth_window % 2 == 1 else smooth_window + 1
+        radial_profile = cv2.GaussianBlur(radial_profile.reshape(-1, 1), (0, 0), gaussian_size * 0.15).ravel()
 
-    # Search in allowed fraction window
-    lo = int(min_frac * len(bins))
-    hi = int(max_frac * len(bins))
+    prof_min, prof_max = radial_profile.min(), radial_profile.max()
+    profile_range = prof_max - prof_min + 1e-6
+    normalized_profile = (radial_profile - prof_min) / profile_range
+
+    lo = int(min_radius_fraction * len(radial_bins))
+    hi = int(max_radius_fraction * len(radial_bins))
     if hi - lo < 5:
         return HoleEstimate(0.0, 'skip', 0.0)
-    segment = nprof[lo:hi]
-    rel_idx = np.argmin(segment)
-    min_val = float(segment[rel_idx])
-    radius_est = bins[lo + rel_idx]
+    search_segment = normalized_profile[lo:hi]
+    valley_rel_index = int(np.argmin(search_segment))
+    valley_value = float(search_segment[valley_rel_index])
+    valley_radius_px = radial_bins[lo + valley_rel_index]
 
-    # Check valley depth vs outer ring average (take region near 0.5*rmax as baseline)
-    mid_band = nprof[int(0.45*len(bins)):int(0.55*len(bins))].mean()
-    depth = mid_band - min_val
-    confidence = max(0.0, min(1.0, depth * 2.0))  # simple scaling
-    if depth < 0.08:  # too shallow
+    mid_ring_baseline = normalized_profile[int(0.45 * len(radial_bins)) : int(0.55 * len(radial_bins))].mean()
+    depth = mid_ring_baseline - valley_value
+    confidence = max(0.0, min(1.0, depth * 2.0))
+    if depth < 0.08:  # shallow -> no reliable hole
         return HoleEstimate(0.0, 'skip', confidence)
 
-    frac = float(radius_est / rmax)
+    radius_fraction = float(valley_radius_px / outer_radius_f)
     mode = 'skip' if depth > 0.15 else 'dampen'
-    return HoleEstimate(frac=frac, mode=mode, confidence=confidence)
+    return HoleEstimate(radius_fraction=radius_fraction, mode=mode, confidence=confidence)
 
-def auto_adjust_hole(params, estimate: HoleEstimate):
-    if estimate.frac <= 0.0:
+def auto_adjust_hole(params, estimate: HoleEstimate) -> bool:
+    """Apply a HoleEstimate to solver params if a hole was confidently found.
+
+    Returns True if parameters were modified.
+    """
+    # backward compatibility: params.inner_hole_frac expected by solver
+    if estimate.radius_fraction <= 0.0:
         return False
-    params.inner_hole_frac = estimate.frac
+    params.inner_hole_frac = estimate.radius_fraction
     params.inner_hole_mode = estimate.mode
     if estimate.mode == 'dampen' and params.inner_hole_dampen >= 0.3:
         params.inner_hole_dampen = 0.4

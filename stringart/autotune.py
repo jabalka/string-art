@@ -9,43 +9,51 @@ from .detect import detect_board_circle, detect_nail_count
 
 def auto_config(
     image_path: str,
-    canvas: int = 1200,
+    canvas_size: int = 1200,
     invert: bool = True,
     apply_mask: bool = True,
     auto_nails: bool = True,
     verbose: bool = True,
-    n_min: int = 20,
-    n_max: int = 400,
+    min_nails: int = 20,
+    max_nails: int = 400,
     debug_dir: str | None = None,
 ) -> Dict[str, Any]:
-    """
-    Automatically determine circle center/radius and nail count from an input image.
-    Returns a dict of parameters for SolverParams.
-    """
+    """Infer board geometry & nail count; return a SolverParams-compatible dict.
 
-    # load + grayscale [0..1]
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
-    if img is None:
+    Steps:
+      1. Read image as grayscale in [0,1].
+      2. Detect board circle (center & radius) – Hough + fallback.
+      3. Optionally detect nail count (FFT angular analysis). Otherwise default=240.
+      4. Produce heuristic solver parameter defaults.
+    """
+    raw_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if raw_gray is None:
         raise FileNotFoundError(image_path)
-    gray01 = cv2.normalize(img.astype(np.float32), img.astype(np.float32), 0, 1, cv2.NORM_MINMAX)
+    gray_normalized = cv2.normalize(raw_gray.astype(np.float32), raw_gray.astype(np.float32), 0, 1, cv2.NORM_MINMAX)
 
-    # detect board circle
-    cx, cy, R = detect_board_circle(gray01)
+    center_x, center_y, board_radius = detect_board_circle(gray_normalized)
 
-    # nail count detection
     if auto_nails:
-        nails = detect_nail_count(gray01, cx, cy, R, n_min=n_min, n_max=n_max, debug_dir=debug_dir)
+        nail_count = detect_nail_count(
+            gray_normalized,
+            center_x,
+            center_y,
+            board_radius,
+            min_nails=min_nails,
+            max_nails=max_nails,
+            debug_dir=debug_dir,
+        )
     else:
-        nails = 240  # fallback default
+        nail_count = 240
 
     if verbose:
-        print(f"[autotune] Detected {nails} nails at radius={R}px (center=({cx},{cy}))")
+        print(f"[autotune] Detected {nail_count} nails at radius={board_radius}px (center=({center_x},{center_y}))")
 
-    # heuristic defaults
+    scaled_radius = int(board_radius * (canvas_size / raw_gray.shape[0]))
     params: Dict[str, Any] = dict(
-        canvas=canvas,
-        radius=int(R * (canvas / img.shape[0])),  # scale to resized canvas
-        nails=nails,
+        canvas=canvas_size,
+        radius=scaled_radius,
+        nails=nail_count,
         invert=invert,
         apply_mask=apply_mask,
         alpha=0.22,
@@ -62,5 +70,4 @@ def auto_config(
         endpoint_taper=0.25,
         angle_smooth=0.35,
     )
-
     return params
