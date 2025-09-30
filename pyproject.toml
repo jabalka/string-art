@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "stringart"
+version = "0.1.1"
+description = "String-art generator: nails on a circle, step-by-step thread instructions"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.26",
+  "Pillow>=10.0",
+  "opencv-python>=4.9.0.80",
+  "scipy>=1.12",
+  "matplotlib>=3.8",
+  "tqdm>=4.66",
+  "click>=8.1",
+]
+
+[project.scripts]
+stringart = "stringart.cli:main"
+stringart-render-nails = "stringart.scripts.render_nails:main"
+
+[tool.setuptools.package-data]
+where = ["."]
+include = ["stringart*"]
