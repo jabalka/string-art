@@ -49,8 +49,14 @@ def preprocess_image(
     feather_px: int = 8,
     suppress_nail_heads_px: int = 0,
     n: int = 240,
+    mask_inflate_frac: float = 0.0,
+    defer_mask: bool = False,
 ) -> np.ndarray:
-    """Letterbox (no crop), resize, optional rim policy, optional nail suppression."""
+    """Letterbox (no crop), resize.
+
+    If defer_mask=True the circular masking is skipped (caller can mask later).
+    mask_inflate_frac inflates the mask radius before application.
+    """
     pil = Image.open(image_path).convert("RGB")
     pil = ImageOps.autocontrast(pil)
 
@@ -62,13 +68,16 @@ def preprocess_image(
     target = (1.0 - gray) if invert else gray
     target = target.astype(np.float32)
 
-    if apply_mask:
+    if apply_mask and not defer_mask:
         if rim == "keep":
-            mask = _feathered_circle_mask(canvas, radius, edge_margin_px=0, feather_px=0)
+            eff_r = int(min(canvas//2 - 1, radius * (1.0 + max(0.0, mask_inflate_frac))))
+            mask = _feathered_circle_mask(canvas, eff_r, edge_margin_px=0, feather_px=0)
         elif rim == "feather":
-            mask = _feathered_circle_mask(canvas, radius, edge_margin_px=edge_margin_px, feather_px=feather_px)
+            eff_r = int(min(canvas//2 - 1, radius * (1.0 + max(0.0, mask_inflate_frac))))
+            mask = _feathered_circle_mask(canvas, eff_r, edge_margin_px=edge_margin_px, feather_px=feather_px)
         else:  # erode
-            mask = _feathered_circle_mask(canvas, radius, edge_margin_px=edge_margin_px, feather_px=0)
+            eff_r = int(min(canvas//2 - 1, radius * (1.0 + max(0.0, mask_inflate_frac))))
+            mask = _feathered_circle_mask(canvas, eff_r, edge_margin_px=edge_margin_px, feather_px=0)
         target *= mask
 
     if suppress_nail_heads_px > 0:

@@ -1,7 +1,16 @@
+README.md
 pyproject.toml
-stringart/_init_.py
+stringart/__init__.py
+stringart/autotune.py
+stringart/chords.py
 stringart/cli.py
+stringart/detect.py
 stringart/geometry.py
+stringart/hole.py
+stringart/metrics.py
+stringart/pattern_init.py
+stringart/preprocess.py
+stringart/solver.py
 stringart/visualize.py
 stringart.egg-info/PKG-INFO
 stringart.egg-info/SOURCES.txt
@@ -9,4 +18,5 @@ stringart.egg-info/dependency_links.txt
 stringart.egg-info/entry_points.txt
 stringart.egg-info/requires.txt
 stringart.egg-info/top_level.txt
+stringart/scripts/__init__.py
 stringart/scripts/render_nails.py

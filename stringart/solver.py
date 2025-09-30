@@ -7,7 +7,7 @@ from PIL import Image
 from tqdm import tqdm
 import cv2
 
-from .geometry import generate_nails, index_to_label, label_to_index
+from .geometry import generate_nails, index_to_label
 from .visualize import render_nail_map
 from .metrics import save_metrics
 from .chords import get_chord_mask
@@ -20,7 +20,7 @@ class SolverParams:
     line_thickness_px: int = 1
     blur_sigma: float = 0.0
     min_chord_px: float = 15.0
-    per_nail_max_hits: int = 40     # cap to avoid grainy overuse
+    per_nail_max_hits: int = 40
 
     # canvas + nails
     canvas: int = 1200
@@ -43,19 +43,30 @@ class SolverParams:
     # --- AUTO-STOPPING ---
     auto_steps: bool = True
     max_steps: int = 4000
-    coverage: float = 0.85          # explain this fraction of residual energy
+    coverage: float = 0.85
     rel_improve: float = 1e-4
     abs_improve: float = 1e-6
     patience: int = 50
     window: int = 20
 
     # NEW: endpoint taper & smoothness
-    endpoint_taper: float = 0.20    # 0..1, fades each chord end
-    angle_smooth: float = 0.25      # 0..1, prefer small direction changes
+    endpoint_taper: float = 0.20
+    angle_smooth: float = 0.25
+    # Stopping condition (optional): average per-nail usage
+    avg_hits_stop: float | None = None  # if set (e.g. 2.0) stop when mean(per_hits) >= value
+    # Inner hole handling
+    inner_hole_frac: float = 0.0     # fraction of radius regarded as exclusion zone (skip/dampen chords crossing it)
+    inner_hole_mode: str = "skip"    # "skip" or "dampen"
+    inner_hole_dampen: float = 0.3   # multiplier when mode=dampen
+    # Refinement
+    refine_rounds: int = 0
+    refine_mse_thresh: float = 0.012
+    refine_alpha_scale: float = 0.7
 
-# ---------- helpers ----------
-def _dist(p1: Tuple[float,float], p2: Tuple[float,float]) -> float:
+
+def _dist(p1: Tuple[float, float], p2: Tuple[float, float]) -> float:
     return float(((p1[0]-p2[0])**2 + (p1[1]-p2[1])**2) ** 0.5)
+
 
 def _score_line_coarse(cur_xy, j_xy, res_coarse: np.ndarray, scale: float, stride: int) -> float:
     x1, y1 = cur_xy; x2, y2 = j_xy
@@ -76,6 +87,7 @@ def _score_line_coarse(cur_xy, j_xy, res_coarse: np.ndarray, scale: float, strid
     vals = (Ia*(1-wx)*(1-wy) + Ib*wx*(1-wy) + Ic*(1-wx)*wy + Id*wx*wy)
     return float(np.sum(vals))
 
+
 def save_overlay(outdir: str, target: np.ndarray, result: np.ndarray):
     canvas = target.shape[0]
     residual = np.clip(target - result, 0.0, 1.0)
@@ -86,11 +98,13 @@ def save_overlay(outdir: str, target: np.ndarray, result: np.ndarray):
     combo.paste(A, (0,0)); combo.paste(B, (canvas,0)); combo.paste(C, (canvas*2,0))
     combo.save(os.path.join(outdir, "preview_overlay.png"))
 
+
 def save_result_preview(outdir: str, result: np.ndarray, invert_preview: bool = False):
     arr = 1.0 - result if invert_preview else result
     Image.fromarray(np.uint8(np.clip(arr,0,1)*255), mode="L").convert("RGB").save(
         os.path.join(outdir, "preview_final.png")
     )
+
 
 def write_instructions(outdir: str, steps_list: List[Tuple[int,int]], n: int):
     import csv
@@ -105,54 +119,42 @@ def write_instructions(outdir: str, steps_list: List[Tuple[int,int]], n: int):
             f.write(f"{index_to_label(a, n)}-{index_to_label(b, n)}\n")
     return csv_path, txt_path
 
-# ---------- main solver ----------
+
 def greedy_solver(
     target: np.ndarray,
     params: SolverParams,
     outdir: str,
-    init_steps: Optional[List[Tuple[int,int]]] = None
+    init_steps: Optional[List[Tuple[int,int]]] = None,
+    initial_result: Optional[np.ndarray] = None,
+    append: bool = False,
 ):
     np.random.seed(params.seed)
     n = params.nails
     canvas = params.canvas; radius = params.radius; cx = cy = canvas // 2
-    nails_xy = generate_nails(n=n, center=(cx,cy), radius=radius)
+    nails_xy = tuple(generate_nails(n=n, center=(cx,cy), radius=radius))
 
     render_nail_map(os.path.join(outdir, "legend_nails.png"),
                     canvas=canvas, radius=radius, n=n,
                     show_labels=True, show_indices=False)
 
     # state
-    result = np.zeros_like(target, dtype=np.float32)
-    residual = target.copy()
+    if initial_result is not None:
+        result = initial_result.copy().astype(np.float32)
+        result = np.clip(result, 0.0, 1.0)
+        residual = np.clip(target - result, 0.0, 1.0)
+        steps_out: List[Tuple[int,int]] = [] if not append else (init_steps or []).copy()
+    else:
+        result = np.zeros_like(target, dtype=np.float32)
+        residual = target.copy()
+        steps_out: List[Tuple[int,int]] = []
     per_hits = np.zeros((n,), dtype=np.int32)
-    steps_out: List[Tuple[int,int]] = []
 
-    # initial residual energy (L1) — matches greedy score
     flat_res = residual.ravel()
     R0 = float(flat_res.sum() + 1e-12)
 
-    # apply bootstrap if given
     cur = 0
     last_pair = (-1,-1)
-    prev_vec: Optional[Tuple[float,float]] = None  # ---------- keep track of last direction
-    if init_steps:
-        flat = result.ravel()
-        for (a,b) in init_steps:
-            idx, w = get_chord_mask(a, b, tuple(nails_xy), canvas,
-                                    params.line_thickness_px, params.blur_sigma,
-                                    params.endpoint_taper)
-            if idx.size:
-                flat[idx] = np.clip(flat[idx] + params.alpha * w, 0.0, 1.0)
-                steps_out.append((a,b))
-                per_hits[a] += 1; per_hits[b] += 1
-                last_pair = (min(a,b), max(a,b))
-        result = flat.reshape(result.shape)
-        residual = np.clip(target - result, 0.0, 1.0)
-        cur = init_steps[-1][1]
-        a, b = init_steps[-1]
-        x0, y0 = nails_xy[a]; x1, y1 = nails_xy[b]
-        prev_vec = (x1 - x0, y1 - y0)                      # ---------- initial prev_vec
-        flat_res = residual.ravel()
+    prev_vec: Optional[Tuple[float,float]] = None
 
     # fast-mode helpers
     s = params.candidate_stride
@@ -166,14 +168,13 @@ def greedy_solver(
     low_improve_streak = 0
     step_limit = params.max_steps
 
-    # main loop
     num_steps_run = 0
     with tqdm(total=step_limit, desc="[stringart] greedy-fast") as pbar:
         while True:
             if not params.auto_steps and num_steps_run >= params.max_steps:
                 break
 
-            # --- candidate list
+            # candidates
             coarse_scores = []
             cand_js = []
             cur_xy = nails_xy[cur]
@@ -187,7 +188,7 @@ def greedy_solver(
             if not cand_js:
                 break
 
-            # --- coarse screening
+            # coarse scoring
             for j in cand_js:
                 coarse_scores.append(
                     _score_line_coarse(cur_xy, nails_xy[j], res_coarse, scale=scale, stride=params.sample_stride)
@@ -196,26 +197,37 @@ def greedy_solver(
                 idxs = np.argpartition(np.array(coarse_scores), -params.topk_refine)[-params.topk_refine:]
                 cand_js = [cand_js[i] for i in idxs]
 
-            # --- refine on full-res (with endpoint taper & angle smoothness)
+            # refine on full-res
             best_j = None; best_score = -1.0; best_mask = None
             flat_res = residual.ravel()
             for j in cand_js:
-                idx, w = get_chord_mask(cur, j, tuple(nails_xy), canvas,
+                idx, w = get_chord_mask(cur, j, nails_xy, canvas,
                                         params.line_thickness_px, params.blur_sigma,
                                         params.endpoint_taper)
                 if idx.size == 0:
                     continue
                 score = float(np.dot(flat_res[idx], w))
 
-                # angle smoothness (prefer small change in direction)
+                # Inner hole penalty/skip
+                if params.inner_hole_frac > 0.0:
+                    # segment center distance to board center
+                    mx = 0.5 * (nails_xy[cur][0] + nails_xy[j][0]) - cx
+                    my = 0.5 * (nails_xy[cur][1] + nails_xy[j][1]) - cy
+                    mid_r = (mx*mx + my*my) ** 0.5
+                    if mid_r < params.inner_hole_frac * radius:
+                        if params.inner_hole_mode == "skip":
+                            continue
+                        else:
+                            score *= params.inner_hole_dampen
+
                 if prev_vec is not None and params.angle_smooth > 0.0:
                     vx0, vy0 = prev_vec
                     vx1 = nails_xy[j][0] - nails_xy[cur][0]
                     vy1 = nails_xy[j][1] - nails_xy[cur][1]
                     n0 = (vx0*vx0 + vy0*vy0) ** 0.5 + 1e-9
                     n1 = (vx1*vx1 + vy1*vy1) ** 0.5 + 1e-9
-                    cosang = (vx0*vx1 + vy0*vy1) / (n0 * n1)  # [-1,1]
-                    smooth = 0.5 * (1.0 + cosang)            # [0..1]
+                    cosang = (vx0*vx1 + vy0*vy1) / (n0 * n1)
+                    smooth = 0.5 * (1.0 + cosang)
                     score *= (1.0 - params.angle_smooth) + params.angle_smooth * smooth
 
                 if score > best_score:
@@ -224,7 +236,7 @@ def greedy_solver(
             if best_j is None or best_score <= 1e-10:
                 break
 
-            # --- apply best
+            # apply step
             if best_mask is None:
                 break
             idx, w = best_mask
@@ -237,11 +249,9 @@ def greedy_solver(
             after_sum = float(flat_res.sum())
             gain = max(0.0, before_sum - after_sum)
 
-            # update state
             steps_out.append((cur, best_j))
             per_hits[cur] += 1; per_hits[best_j] += 1
             last_pair = (min(cur,best_j), max(cur,best_j))
-            # ---------- update prev_vec AFTER using cur→best_j
             prev_vec = (
                 nails_xy[best_j][0] - nails_xy[cur][0],
                 nails_xy[best_j][1] - nails_xy[cur][1],
@@ -250,7 +260,6 @@ def greedy_solver(
             num_steps_run += 1
             pbar.update(1)
 
-            # refresh coarse residual occasionally
             if (num_steps_run % 10) == 0:
                 res_coarse = cv2.resize(residual, (canvas//params.coarse_scale, canvas//params.coarse_scale),
                                         interpolation=cv2.INTER_AREA)
@@ -265,7 +274,6 @@ def greedy_solver(
                     pbar.set_postfix_str(f"stop: coverage {coverage_now:.3f} ≥ {params.coverage:.3f}")
                     break
 
-                # plateau detection
                 recent_gains.append(gain)
                 if len(recent_gains) > params.window:
                     recent_gains = recent_gains[-params.window:]
@@ -279,19 +287,45 @@ def greedy_solver(
                     pbar.set_postfix_str(f"stop: plateau avg_gain={avg_gain:.3e}")
                     break
 
+                # Optional per-nail usage stop
+                if params.avg_hits_stop is not None and np.mean(per_hits) >= params.avg_hits_stop:
+                    pbar.set_postfix_str(f"stop: average nail used ≥ {params.avg_hits_stop}")
+                    break
+
                 if num_steps_run >= params.max_steps:
                     pbar.set_postfix_str("stop: max_steps cap")
                     break
 
-    # outputs
-    write_instructions(outdir, steps_out, n=n)
+    return steps_out, result, residual
+
+
+def solve_with_refinement(target: np.ndarray, params: SolverParams, outdir: str):
+    # baseline
+    steps1, result, residual = greedy_solver(target, params, outdir)
+    from .metrics import mse_psnr
+    mse, _psnr = mse_psnr(target, result)
+    all_steps = steps1.copy()
+    cur_alpha = params.alpha
+    round_idx = 0
+    while params.refine_rounds > 0 and round_idx < params.refine_rounds and mse > params.refine_mse_thresh:
+        round_idx += 1
+        cur_alpha *= params.refine_alpha_scale
+        refine_params = params
+        refine_params.alpha = cur_alpha
+        refine_params.max_steps = int(params.max_steps * 1.3)
+        refine_params.auto_steps = True
+        steps_r, result, residual = greedy_solver(target, refine_params, outdir,
+                                                  initial_result=result, append=True)
+        all_steps.extend(steps_r)
+        mse, _ = mse_psnr(target, result)
+
+    # Final output artifacts
+    write_instructions(outdir, all_steps, n=params.nails)
     save_result_preview(outdir, result, invert_preview=False)
     save_overlay(outdir, target, result)
     m = save_metrics(os.path.join(outdir, "metrics.json"), target, result)
-
     dump = asdict(params)
-    dump["actual_steps"] = len(steps_out)
+    dump["actual_steps"] = len(all_steps)
     with open(os.path.join(outdir, "params.json"), "w", encoding="utf-8") as f:
         json.dump(dump, f, indent=2)
-
-    return steps_out, m
+    return all_steps, m

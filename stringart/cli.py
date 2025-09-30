@@ -1,172 +1,160 @@
 from __future__ import annotations
-import click, os
-from .geometry import generate_default_canvas, index_to_label, label_to_index
-from .preprocess import preprocess_image
-from .solver import SolverParams, greedy_solver
-from .visualize import render_nail_map
-import cv2
+import os
+import click
+import numpy as np
 
-@click.group(context_settings=dict(help_option_names=["-h", "--help"]))
+from .preprocess import preprocess_image
+from .solver import greedy_solver, SolverParams, solve_with_refinement
+from .autotune import auto_config
+from .geometry import generate_nails
+from .visualize import render_nail_map
+
+
+@click.group()
 def main():
-    """String-art generator CLI."""
+    """StringArt generator CLI"""
     pass
 
-@main.command()
-@click.option("--image", type=click.Path(exists=True, dir_okay=False), required=True)
-@click.option("--out", "outdir", type=click.Path(file_okay=False), default="out", show_default=True)
-@click.option("--canvas", type=int, default=900, show_default=True, help="Working canvas (px)")
-@click.option("--steps", type=int, default=None, help="If provided, run fixed number of steps (disables auto steps)")
-@click.option("--auto-all/--manual", default=True, show_default=True,
-              help="Decide invert, rim, suppression, nails, bootstrap, fast-mode, and auto-stopping automatically")
-# manual overrides (used only when --manual)
-@click.option("--nails", type=int, default=240, show_default=True)
-@click.option("--radius", type=int, default=None)
-@click.option("--invert/--no-invert", default=False, show_default=True)
-@click.option("--rim", type=click.Choice(["keep","feather","erode"]), default="keep", show_default=True)
-@click.option("--edge-margin", type=int, default=12, show_default=True)
-@click.option("--feather", type=int, default=8, show_default=True)
-@click.option("--suppress-nail-heads", type=int, default=0, show_default=True)
-@click.option("--alpha", type=float, default=0.22, show_default=True)
-@click.option("--thickness", type=int, default=1, show_default=True)
-@click.option("--blur", type=float, default=0.6, show_default=True)
-@click.option("--min-chord", type=float, default=30.0, show_default=True)
-@click.option("--candidate-stride", type=int, default=3, show_default=True)
-@click.option("--coarse-scale", type=int, default=6, show_default=True)
-@click.option("--sample-stride", type=int, default=2, show_default=True)
-@click.option("--topk-refine", type=int, default=24, show_default=True)
-@click.option("--bootstrap", type=click.Choice(["none","star"]), default="star", show_default=True)
-@click.option("--bootstrap-steps", type=int, default=600, show_default=True)
-@click.option("--bootstrap-k", type=int, default=0, show_default=True, help="0=auto")
-# auto-stop controls (used in both modes; values auto-set in auto-all)
-@click.option("--auto-steps/--fixed-steps", default=True, show_default=True)
-@click.option("--max-steps", type=int, default=4000, show_default=True)
-@click.option("--coverage", type=float, default=0.87, show_default=True)
-@click.option("--rel-improve", type=float, default=1e-4, show_default=True)
-@click.option("--abs-improve", type=float, default=8e-7, show_default=True)
-@click.option("--patience", type=int, default=60, show_default=True)
-@click.option("--window", type=int, default=20, show_default=True)
-@click.option("--save-every", type=int, default=0, show_default=True)
-@click.option("--seed", type=int, default=1, show_default=True)
-@click.option("--endpoint-taper", type=float, default=0.20, show_default=True, help="Fraction of each chord end to taper (0..1)")
-@click.option("--angle-smooth", type=float, default=0.25, show_default=True, help="Penalty strength for sharp angle changes (0..1)")
-def run(image, outdir, canvas, steps, auto_all, nails, radius, invert, rim, edge_margin, feather, suppress_nail_heads, endpoint_taper, angle_smooth,
-        alpha, thickness, blur, min_chord, candidate_stride, coarse_scale, sample_stride, topk_refine,
-        bootstrap, bootstrap_steps, bootstrap_k,
-        auto_steps, max_steps, coverage, rel_improve, abs_improve, patience, window, save_every, seed):
-    import os
-    os.makedirs(outdir, exist_ok=True)
-    from .autotune import auto_config
-    from .preprocess import preprocess_image
-    from .geometry import generate_default_canvas, generate_nails
-    from .pattern_init import bootstrap_steps as make_boot
-    from .solver import SolverParams, greedy_solver
 
-    canvas, _ = generate_default_canvas(canvas, radius)
+@main.command()
+@click.option("--out", type=click.Path(file_okay=False), required=True, help="Output directory")
+@click.option("--canvas", type=int, default=1200, help="Canvas size (px)")
+@click.option("--radius", type=int, default=540, help="Circle radius (px)")
+@click.option("--nails", type=int, default=240, help="Number of nails")
+def nails(out, canvas, radius, nails):
+    """Render just the nail map (legend)"""
+    os.makedirs(out, exist_ok=True)
+    render_nail_map(os.path.join(out, "legend_nails.png"),
+                    canvas=canvas, radius=radius, n=nails,
+                    show_labels=True, show_indices=False)
+    click.echo(f"Nail map saved to {out}/legend_nails.png")
+
+
+@main.command()
+@click.option("-i", "--image", type=click.Path(exists=True), required=True, help="Input image")
+@click.option("-o", "--out", type=click.Path(file_okay=False), required=True, help="Output directory")
+@click.option("-c", "--canvas", type=int, default=1200, help="Canvas size (px)")
+@click.option("-r", "--radius", type=int, default=None, help="Manual radius (px)")
+@click.option("-n", "--nails", type=int, default=None, help="Manual nail count")
+@click.option("--invert/--no-invert", default=True, help="Invert input image (default: True)")
+@click.option("--auto-all/--no-auto-all", default=False, help="Auto-configure nails, radius, params")
+@click.option("--auto-nails/--no-auto-nails", default=True, help="Automatically detect nail count from rim")
+@click.option("--min-nails", type=int, default=20, help="Lower bound for auto nail detection")
+@click.option("--max-nails", type=int, default=360, help="Upper bound for auto nail detection")
+@click.option("--debug-detect/--no-debug-detect", default=False, help="Save nail detection debug plots")
+@click.option("-s", "--steps", type=int, default=None, help="Fixed max steps (omit for auto)")
+@click.option("--mask-inflate-frac", type=float, default=0.02, help="Inflate detected/used radius fraction before masking")
+@click.option("--inner-hole-frac", type=float, default=0.0, help="Inner hole exclusion fraction of radius (0 disables)")
+@click.option("--inner-hole-mode", type=click.Choice(["skip","dampen"]), default="skip")
+@click.option("--inner-hole-dampen", type=float, default=0.3, help="Score multiplier when mode=dampen")
+@click.option("--refine-rounds", type=int, default=0, help="Number of refinement passes after baseline")
+@click.option("--refine-mse-thresh", type=float, default=0.012, help="Stop refining when MSE <= threshold")
+@click.option("--refine-alpha-scale", type=float, default=0.7, help="Alpha scale per refinement round")
+@click.option("--avg-hits-stop", type=float, default=None, help="Optional stop when average nail hits reaches this (omit to disable)")
+@click.option("--auto-inner-hole/--no-auto-inner-hole", default=False, help="Automatically detect inner hole (overrides manual inner-hole-frac/mode if strong)")
+@click.option("--hole-debug/--no-hole-debug", default=False, help="Save hole radial profile debug plot")
+@click.option("--save-every", type=int, default=200, help="Save preview every N steps (0=never)")
+def run(image, out, canvas, radius, nails, invert, auto_all, auto_nails, min_nails, max_nails, debug_detect,
+    steps, mask_inflate_frac, inner_hole_frac, inner_hole_mode, inner_hole_dampen,
+    refine_rounds, refine_mse_thresh, refine_alpha_scale, avg_hits_stop,
+    auto_inner_hole, hole_debug, save_every):
+    """Run full string art solver"""
+    os.makedirs(out, exist_ok=True)
 
     if auto_all:
-        ac = auto_config(image, canvas=canvas)
-        nails = ac.nails
-        radius = ac.radius
-        invert = ac.invert
-        rim = ac.rim
-        edge_margin = ac.edge_margin
-        feather = ac.feather
-        suppress_nail_heads = ac.suppress_nail_heads
-        min_chord = ac.min_chord_px
-        candidate_stride = ac.candidate_stride
-        coarse_scale = ac.coarse_scale
-        sample_stride = ac.sample_stride
-        topk_refine = ac.topk_refine
-        bootstrap = "star"
-        bootstrap_steps = ac.bootstrap_steps
-        bootstrap_k = ac.bootstrap_k
-        coverage = ac.coverage
-        rel_improve = ac.rel_improve
-        abs_improve = ac.abs_improve
-        patience = ac.patience
-        window = ac.window
-    # keep user-specified endpoint_taper / angle_smooth (no tuple!)
-    endpoint_taper = endpoint_taper
-    angle_smooth = angle_smooth
+        # If user supplies manual nails or radius they override auto pieces
+        params_dict = auto_config(
+            image_path=image, canvas=canvas, invert=invert,
+            auto_nails=auto_nails and (nails is None), verbose=True,
+            n_min=min_nails, n_max=max_nails,
+            debug_dir=(out if debug_detect else None)
+        )
+        if nails is not None:
+            params_dict["nails"] = nails
+        if radius is not None:
+            params_dict["radius"] = radius
+        params = SolverParams(**params_dict)
+    else:
+        if nails is None:
+            nails = 240
+        if radius is None:
+            radius = canvas // 2 - 20
+        # auto heuristic for steps unless user specified --steps (non-negative)
+        auto_steps = steps is None
+        if auto_steps:
+            # heuristic: base = 18 * nails (larger boards need more), clamp
+            est = int(min(12000, max(800, 18 * nails)))
+            max_steps = est
+        else:
+            max_steps = steps
+        params = SolverParams(canvas=canvas, radius=radius, nails=nails,
+                              invert=invert, auto_steps=auto_steps, max_steps=max_steps)
+    params.save_every = save_every
+    # If user provided --steps explicitly during auto_all path, override
+    if steps is not None and params.auto_steps:
+        params.auto_steps = False
+        params.max_steps = steps
 
-    click.echo(f"[auto] nails={nails}  invert={invert}  rim={rim}  R≈{radius}  k_boot={bootstrap_k}")
+    # preprocess input
+    target = preprocess_image(image, canvas=params.canvas, radius=params.radius,
+                              invert=params.invert, apply_mask=params.apply_mask,
+                              outdir=out, rim="keep", n=params.nails,
+                              mask_inflate_frac=mask_inflate_frac, defer_mask=False)
 
-    # preprocess
-    target = preprocess_image(
-        image_path=image, canvas=canvas, radius=radius, invert=invert, apply_mask=True, outdir=outdir,
-        rim=rim, edge_margin_px=edge_margin, feather_px=feather, suppress_nail_heads_px=suppress_nail_heads, n=nails
-    )
+    params.inner_hole_frac = inner_hole_frac
+    params.inner_hole_mode = inner_hole_mode
+    params.inner_hole_dampen = inner_hole_dampen
 
-    # bootstrap steps
-    init_steps = None
-    if bootstrap == "star":
-        k = bootstrap_k
-        if k == 0:
-            # fallback if user forced manual without providing k
-            small = max(256, canvas // 3)
-            import cv2
-            tgt_small = cv2.resize(target, (small, small), interpolation=cv2.INTER_AREA)
-            nails_xy_small = generate_nails(n=nails, center=(small//2, small//2), radius=int(small*0.45))
-            from .pattern_init import choose_best_k_by_correlation
-            ks = list(range(2, max(3, min(80, nails//3))))
-            k, _ = choose_best_k_by_correlation(nails, ks, boots=min(nails*2, 800),
-                                                target_small=tgt_small, nails_xy_small=nails_xy_small)
-        init_steps = make_boot(nails, k, boots=bootstrap_steps)
+    # Auto hole detection (after preprocessing) if enabled
+    if auto_inner_hole:
+        from .hole import estimate_inner_hole, auto_adjust_hole
+        est = estimate_inner_hole(target, params.radius)
+        changed = auto_adjust_hole(params, est)
+        if hole_debug:
+            try:
+                import matplotlib.pyplot as plt, numpy as np
+                # Recompute radial profile figure (reuse logic)
+                h, w = target.shape
+                cx = cy = h//2
+                yy, xx = np.indices(target.shape)
+                rr = np.sqrt((xx-cx)**2 + (yy-cy)**2)
+                mask = rr <= params.radius
+                vals = target[mask]; rvals = rr[mask]
+                bins = np.linspace(0, params.radius, 512)
+                idx = np.digitize(rvals, bins)-1
+                prof = np.zeros(len(bins), dtype=float)
+                for i in range(len(bins)):
+                    m = idx==i
+                    if m.any():
+                        prof[i] = vals[m].mean()
+                fig, ax = plt.subplots(figsize=(5,3))
+                ax.plot(bins/params.radius, (prof-prof.min())/(prof.max()-prof.min()+1e-6))
+                ax.axvline(est.frac, color='r', ls='--', label=f"hole≈{est.frac:.3f} conf={est.confidence:.2f}")
+                ax.set_xlabel('r / R'); ax.set_ylabel('norm mean'); ax.legend()
+                fig.savefig(os.path.join(out, 'hole_detect_debug.png'), dpi=130)
+                plt.close(fig)
+            except Exception:
+                pass
+        if changed:
+            click.echo(f"[auto-hole] inner_hole_frac={params.inner_hole_frac:.3f} mode={params.inner_hole_mode}")
+    params.refine_rounds = refine_rounds
+    # Dynamic refine threshold if user passed negative or zero
+    if refine_rounds > 0 and (refine_mse_thresh <= 0):
+        import numpy as np
+        # approximate baseline MSE relative to uniform mean image
+        est_mse = float(np.mean((target - target.mean())**2))
+        refine_mse_thresh = est_mse * 0.6
+        click.echo(f"[auto-refine] set refine_mse_thresh≈{refine_mse_thresh:.4f} (est_mse={est_mse:.4f})")
+    params.refine_mse_thresh = refine_mse_thresh
+    params.refine_alpha_scale = refine_alpha_scale
+    params.avg_hits_stop = avg_hits_stop
 
-    # If user explicitly provides --steps, force fixed steps mode
-    if steps is not None:
-        auto_steps = False
-        max_steps = steps
+    # run solver
+    steps_out, metrics = solve_with_refinement(target, params, out)
 
-    params = SolverParams(
-        alpha=alpha, line_thickness_px=thickness, blur_sigma=blur,
-        min_chord_px=min_chord, per_nail_max_hits=999999,
-        canvas=canvas, radius=radius, nails=nails, start_label="A1",
-        invert=invert, apply_mask=True, seed=seed, save_every=save_every,
-        candidate_stride=candidate_stride, coarse_scale=coarse_scale,
-        sample_stride=sample_stride, topk_refine=topk_refine,
-        auto_steps=auto_steps, max_steps=max_steps, coverage=coverage,
-        rel_improve=rel_improve, abs_improve=abs_improve, patience=patience, window=window,
-        endpoint_taper=endpoint_taper, angle_smooth=angle_smooth
-    )
+    click.echo(f"Done. {len(steps_out)} steps (after refinement), metrics={metrics}")
+    click.echo(f"Outputs in {out}/")
 
-    steps_out, metrics = greedy_solver(target, params, outdir, init_steps=init_steps)
-    click.echo(f"[stringart] Done. Steps={len(steps_out)}  MSE={metrics['mse']:.6f}  PSNR={metrics['psnr']:.2f}dB  SSIM={metrics['ssim']:.4f}")
-
-
-
-@main.command()
-@click.option("--out", "outdir", type=click.Path(file_okay=False), default="out", show_default=True)
-@click.option("--canvas", type=int, default=1200, show_default=True)
-@click.option("--radius", type=int, default=None)
-@click.option("--nails", type=int, default=240, show_default=True)
-@click.option("--show-labels/--no-labels", default=True, show_default=True)
-@click.option("--show-indices/--no-indices", default=False, show_default=True)
-@click.option("--label-every", type=int, default=1, show_default=True)
-def nails(outdir, canvas, radius, nails, show_labels, show_indices, label_every):
-    """Render a labeled nail map preview PNG."""
-    os.makedirs(outdir, exist_ok=True)
-    render_nail_map(os.path.join(outdir, "nail_map.png"), canvas=canvas, radius=radius, n=nails,
-                    show_labels=show_labels, show_indices=show_indices, label_every=label_every)
-    click.echo(f"[stringart] Wrote {os.path.join(outdir,'nail_map.png')}")
-
-@main.command()
-@click.argument("value")
-@click.option("--nails", type=int, default=240, show_default=True, help="Nail count to interpret labels")
-def label(value: str, nails: int):
-    """Convert between index and label for the given nail count."""
-    s = value.strip()
-    try:
-        i = int(s)
-        click.echo(index_to_label(i, n=nails))
-        return
-    except Exception:
-        pass
-    try:
-        click.echo(str(label_to_index(s, n=nails)))
-        return
-    except Exception as e:
-        raise click.ClickException(str(e))
 
 if __name__ == "__main__":
     main()
